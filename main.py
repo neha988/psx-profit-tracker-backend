@@ -16,8 +16,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import threading
 
-env_path = Path(__file__).parent / ".env.local"
-load_dotenv(dotenv_path=env_path, override=True)
+load_dotenv()
+
+# env_path = Path(__file__).parent / ".env.local"
+# load_dotenv(dotenv_path=env_path, override=True)
 
 app = FastAPI(title="PSX Profit Tracker API")
 app.add_middleware(
@@ -439,6 +441,10 @@ def aggregate_unmatched_trades(trades: list) -> list:
 # ─────────────────────────────────────────────────────────────
 # API ROUTES
 # ─────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"status": "PSX Profit Tracker API is running"}
 
 @app.get("/health")
 async def health():
