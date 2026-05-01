@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+pdfplumber==0.11.4
+supabase==2.7.4
+python-multipart==0.0.9
+python-jose==3.3.0
+python-dotenv==1.0.0
+discord.py==2.4.0
+APScheduler==3.10.4
+requests==2.31.0
