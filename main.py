@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 import uvicorn
 from dotenv import load_dotenv
 from pathlib import Path
@@ -152,13 +153,21 @@ def validate_pdf(text: str) -> Tuple[bool, str]:
         return False, "Not a Munir Khanani Securities document"
     if "settlement" not in tl:
         return False, "Missing Settlement information"
-    if not any(kw in text for kw in ["BUY", "SELL", "T+1REG", "T+0REG"]):
+    if not any(kw in text for kw in ["BUY", "SELL", "T+1REG", "T+0REG", "FT2REG", "FT1REG", "FTREG"]):
         return False, "No BUY/SELL trade records found"
     return True, "Valid"
 
+def detect_broker(text: str) -> str:
+    tl = text.lower()
+    if "akd securities" in tl:
+        return "AKD"
+    if "munirkhanani" in tl or "munir khanani" in tl:
+        return "Munir Khanani"
+    return "Unknown"
+
 STOCK_HEADER_RE = re.compile(
-    r'^([A-Z][A-Z0-9\s&\.\-]+?)\s{2,}([A-Z]{2,10})$'
-    r'|^([A-Z][A-Z0-9\s&\.\-]+)\s+([A-Z]{2,6})$'
+    r'^([A-Z][A-Z0-9\s&\.\-\(\)]+?)\s{2,}([A-Z][A-Z0-9\-]{1,10})$'
+    r'|^([A-Z][A-Z0-9\s&\.\-\(\)]+)\s+([A-Z][A-Z0-9\-]{1,9})$'
 )
 
 SKIP_PREFIXES = (
@@ -183,46 +192,61 @@ def detect_stock_header(line: str):
             return company, symbol
     return None
 
-TRADE_LINE_RE = re.compile(
-    r'(T\+\d+REG)\s+'
-    r'(?:[PB]\s*)?(SELL|BUY|PSELL|PBUY|BBUY|BSELL)\s+'
-    r'([\d,]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'([\d.]+)\s+'
-    r'(-?[\d,]+\.?\d*)'
-)
+TRADE_LINE_RE = re.compile(r'\b(T\+\d+REG|FT\d*REG)\b')
+ACTION_RE = re.compile(r'\b(PSELL|PBUY|BBUY|BSELL|SELL|BUY|S|B)\b')
+NUMBER_RE = re.compile(r'\(?-?[\d,]+(?:\.\d+)?\)?')
+
+def parse_pdf_number(value: str) -> float:
+    value = value.strip()
+    is_parenthesized = value.startswith("(") and value.endswith(")")
+    cleaned = value.strip("()").replace(",", "")
+    parsed = float(cleaned)
+    return -abs(parsed) if is_parenthesized else parsed
+
+def parse_trade_numbers(line: str, start: int):
+    values = NUMBER_RE.findall(line[start:])
+    return values if len(values) >= 11 else None
 
 def parse_trade_line(line, symbol, company):
-    m = TRADE_LINE_RE.search(line)
-    if not m:
+    settlement_m = TRADE_LINE_RE.search(line)
+    if not settlement_m:
         return None
-    raw = m.group(2).upper().replace(' ', '')
-    trade_type = 'SELL' if 'SELL' in raw else 'BUY'
-    qty      = int(m.group(3).replace(',', ''))
-    rate     = float(m.group(4))
-    comm_raw = float(m.group(5))
-    sst      = float(m.group(6))
-    cdc      = float(m.group(7))
-    cvt_wht  = float(m.group(8))
-    others   = float(m.group(9))
-    laga     = float(m.group(10))
-    secp     = float(m.group(11))
-    ncs      = float(m.group(12))
-    amount   = float(m.group(13).replace(',', ''))
+
+    action_m = ACTION_RE.search(line, settlement_m.end())
+    values = parse_trade_numbers(line, action_m.end() if action_m else settlement_m.end())
+    if not values:
+        return None
+
+    settlement_type = settlement_m.group(1)
+    amount   = parse_pdf_number(values[-1])
+    if action_m:
+        raw = action_m.group(1).upper().replace(' ', '')
+        trade_type = 'SELL' if 'SELL' in raw or raw == 'S' else 'BUY'
+    else:
+        trade_type = 'SELL' if amount < 0 else 'BUY'
+
+    qty      = int(parse_pdf_number(values[0]))
+    rate     = parse_pdf_number(values[1])
+    comm_raw = parse_pdf_number(values[2])
+    sst      = parse_pdf_number(values[3])
+    cdc      = parse_pdf_number(values[4])
+    cvt_wht  = parse_pdf_number(values[5])
+    others   = parse_pdf_number(values[6])
+    laga     = parse_pdf_number(values[7])
+    secp     = parse_pdf_number(values[8])
+    ncs      = parse_pdf_number(values[9])
     commission = round(qty * rate * comm_raw / 100, 2) if comm_raw < 1 else round(comm_raw, 2)
     total_charges = round(commission + sst + cdc + cvt_wht + others + laga + secp + ncs, 2)
-    print(f"  ✓ {symbol} {trade_type} qty={qty} @ {rate} | net={amount}")
+    
+    # Detect if it's a futures contract
+    is_futures = settlement_type.startswith("FT") or '-' in symbol and any(m in symbol.upper() for m in ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'])
+    
+    trade_label = f"Futures {trade_type}" if is_futures else f"{trade_type}"
+    print(f"  OK {symbol} {trade_label} qty={qty} @ {rate} | net={amount}")
     return {
         "company_name": company or symbol,
         "symbol": symbol,
-        "settlement_type": m.group(1),
+        "settlement_type": settlement_type,
         "trade_type": trade_type,
         "quantity": qty,
         "rate": rate,
@@ -232,8 +256,57 @@ def parse_trade_line(line, symbol, company):
         "total_charges": total_charges,
         "gross_amount": abs(amount),
         "net_amount": amount,
+        "is_futures": is_futures,
         "is_short_sell": False, "matched": False, "pair_id": None
     }
+
+def build_trade_signature(trades: list) -> str:
+    return "_".join(
+        f"{t['settlement_type']}:{t['symbol']}:{t['trade_type']}:{int(t['quantity'])}:{float(t['rate'])}"
+        for t in sorted(trades, key=lambda item: (
+            item["settlement_type"], item["symbol"], item["trade_type"], int(item["quantity"]), float(item["rate"])
+        ))
+    )
+
+def statement_trade_signature(supabase, user_id: str, statement_id: str) -> Tuple[str, int]:
+    existing_trades = supabase.table("trades").select(
+        "settlement_type,symbol,trade_type,quantity,rate"
+    ).eq("user_id", user_id).eq("statement_db_id", statement_id).execute().data
+
+    return build_trade_signature(existing_trades), len(existing_trades)
+
+def delete_statement_by_id(supabase, user_id: str, statement_id: str):
+    existing_trades = supabase.table("trades").select("id,pair_id").eq(
+        "user_id", user_id
+    ).eq("statement_db_id", statement_id).execute().data
+
+    pair_ids = sorted({t["pair_id"] for t in existing_trades if t.get("pair_id")})
+    if pair_ids:
+        supabase.table("trades").update({
+            "matched": False,
+            "pair_id": None,
+            "gross_pl": None,
+            "net_pl": None,
+        }).eq("user_id", user_id).in_("pair_id", pair_ids).execute()
+
+    supabase.table("trades").delete().eq("statement_db_id", statement_id).eq("user_id", user_id).execute()
+    supabase.table("statements").delete().eq("id", statement_id).eq("user_id", user_id).execute()
+
+def user_scoped_statement_id(user_id: str, unique_statement_id: str) -> str:
+    return f"{user_id}_{unique_statement_id}"
+
+def find_user_statements_by_unique_ids(supabase, user_id: str, unique_ids: list) -> list:
+    found = []
+    seen = set()
+    for unique_id in unique_ids:
+        rows = supabase.table("statements").select("id,unique_statement_id").eq(
+            "unique_statement_id", unique_id
+        ).eq("user_id", user_id).execute().data or []
+        for row in rows:
+            if row["id"] not in seen:
+                found.append(row)
+                seen.add(row["id"])
+    return found
 
 def parse_munir_khanani_pdf(pdf_bytes: bytes) -> dict:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -269,22 +342,26 @@ def parse_munir_khanani_pdf(pdf_bytes: bytes) -> dict:
         h = detect_stock_header(s)
         if h:
             current_company, current_symbol = h
-            print(f"  → Stock: {current_symbol} ({current_company})")
+            print(f"  Stock: {current_symbol} ({current_company})")
             continue
-        if current_symbol and re.search(r'T\+\d+REG', s) and re.search(r'SELL|BUY', s):
+        if current_symbol and re.search(r'(T\+\d+REG|FT\d*REG)', s):
             t = parse_trade_line(s, current_symbol, current_company)
             if t:
                 trades.append(t)
 
     symbols_in_pdf = sorted(set(t["symbol"] for t in trades))
     symbols_str    = "_".join(symbols_in_pdf) if symbols_in_pdf else "UNKNOWN"
-    unique_id      = f"{statement_id}_{trade_date}_{symbols_str}"
+    legacy_unique_id = f"{statement_id}_{trade_date}_{symbols_str}"
+    trade_signature = build_trade_signature(trades)
+    unique_id      = f"{legacy_unique_id}_{trade_signature}" if trade_signature else legacy_unique_id
 
-    print(f"DEBUG: {statement_id} {trade_date} → {len(trades)} trades | unique_id: {unique_id}")
+    print(f"DEBUG: {statement_id} {trade_date} -> {len(trades)} trades | unique_id: {unique_id}")
 
     return {
         "statement_id":         statement_id,
         "unique_statement_id":  unique_id,
+        "legacy_unique_statement_id": legacy_unique_id,
+        "trade_signature":      trade_signature,
         "trade_date":           trade_date,
         "settlement_date":      set_m.group(1) if set_m else None,
         "client_name":          client_name,
@@ -292,10 +369,244 @@ def parse_munir_khanani_pdf(pdf_bytes: bytes) -> dict:
         "trades":               trades,
     }
 
+AKD_DATE_RE = re.compile(r'\bDate\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})')
+AKD_MEMO_RE = re.compile(r'\bMemo\s*#\s*\n?\s*([A-Z0-9/\-]+)', re.IGNORECASE)
+AKD_CLIENT_RE = re.compile(r'\bTo\s+(.+?)(?:\s+-\s+|\n)', re.IGNORECASE)
+AKD_TRADE_RE = re.compile(
+    r'^([A-Z][A-Z0-9\-]+)\s+'
+    r'(Ready|Future|F-Mtm|F-MTM)\s+'
+    r'([\d,]+)\s+'
+    r'([\d.]+)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)\s+'
+    r'([\d,]+(?:\.\d+)?)$',
+    re.IGNORECASE
+)
 
-def match_trades(user_id, supabase):
+def parse_akd_pdf(pdf_bytes: bytes) -> dict:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    if detect_broker(full_text) != "AKD":
+        raise ValueError("Not an AKD Securities document")
+
+    date_m = AKD_DATE_RE.search(full_text)
+    if not date_m:
+        raise ValueError("Missing AKD trade date")
+    trade_date = datetime.strptime(" ".join(date_m.groups()), "%B %d %Y").date().isoformat()
+
+    memo_m = AKD_MEMO_RE.search(full_text)
+    client_m = AKD_CLIENT_RE.search(full_text)
+    statement_id = memo_m.group(1).strip() if memo_m else "UNKNOWN"
+    client_name = client_m.group(1).strip() if client_m else "Unknown"
+
+    trades = []
+    current_side = None
+
+    for raw_line in full_text.splitlines():
+        line = re.sub(r'\s+', ' ', raw_line.strip())
+        if not line:
+            continue
+
+        compact = line.replace(" ", "").upper()
+        if compact == "PURCHASE":
+            current_side = "BUY"
+            continue
+        if compact == "SALE":
+            current_side = "SELL"
+            continue
+        if line.upper().startswith(("TOTAL :", "CLIENT TOTAL", "SUMMARY")):
+            current_side = None
+            continue
+        if not current_side:
+            continue
+
+        m = AKD_TRADE_RE.match(line)
+        if not m:
+            continue
+
+        symbol = m.group(1).upper()
+        market = m.group(2).upper()
+        qty = int(parse_pdf_number(m.group(3)))
+        rate = parse_pdf_number(m.group(4))
+        commission = parse_pdf_number(m.group(5))
+        cvt_wht = parse_pdf_number(m.group(6))
+        secp = parse_pdf_number(m.group(7))
+        laga = parse_pdf_number(m.group(8))
+        psx_laga = parse_pdf_number(m.group(9))
+        sst = parse_pdf_number(m.group(10))
+        ncs = parse_pdf_number(m.group(11))
+        cdc = parse_pdf_number(m.group(12))
+        amount = parse_pdf_number(m.group(13))
+        total_charges = round(commission + cvt_wht + secp + laga + psx_laga + sst + ncs + cdc, 2)
+        is_futures = market.startswith("F") or '-' in symbol and any(
+            month in symbol for month in ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+        )
+
+        trades.append({
+            "company_name": symbol,
+            "symbol": symbol,
+            "settlement_type": market,
+            "trade_type": current_side,
+            "quantity": qty,
+            "rate": rate,
+            "commission": commission,
+            "sst": sst,
+            "cdc": cdc,
+            "cvt_wht": cvt_wht,
+            "others": psx_laga,
+            "laga": laga,
+            "secp": secp,
+            "ncs": ncs,
+            "total_charges": total_charges,
+            "gross_amount": abs(amount),
+            "net_amount": -abs(amount) if current_side == "SELL" else abs(amount),
+            "is_futures": is_futures,
+            "is_short_sell": False,
+            "matched": False,
+            "pair_id": None,
+        })
+        print(f"  OK AKD {symbol} {current_side} qty={qty} @ {rate} | net={trades[-1]['net_amount']}")
+
+    if not trades:
+        raise ValueError("No AKD trade rows found")
+
+    symbols_str = "_".join(sorted(set(t["symbol"] for t in trades)))
+    legacy_unique_id = f"AKD_{statement_id}_{trade_date}_{symbols_str}"
+    trade_signature = build_trade_signature(trades)
+    unique_id = f"{legacy_unique_id}_{trade_signature}" if trade_signature else legacy_unique_id
+
+    return {
+        "broker": "AKD",
+        "statement_id": statement_id,
+        "unique_statement_id": unique_id,
+        "legacy_unique_statement_id": legacy_unique_id,
+        "trade_signature": trade_signature,
+        "trade_date": trade_date,
+        "settlement_date": None,
+        "client_name": client_name,
+        "cdc_id": None,
+        "trades": trades,
+    }
+
+def parse_pdf_statement(pdf_bytes: bytes) -> dict:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        sample_text = "\n".join(page.extract_text() or "" for page in pdf.pages[:2])
+
+    broker = detect_broker(sample_text)
+    if broker == "AKD":
+        return parse_akd_pdf(pdf_bytes)
+    if broker == "Munir Khanani":
+        parsed = parse_munir_khanani_pdf(pdf_bytes)
+        parsed["broker"] = "Munir Khanani"
+        return parsed
+    raise ValueError("Broker format not supported yet")
+
+def normalize_account_value(value: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().upper())
+
+def broker_account_identity(row: dict) -> Tuple[str, str]:
+    broker = row.get("broker") or "Unknown"
+    cdc_id = normalize_account_value(row.get("cdc_id"))
+    client_name = normalize_account_value(row.get("client_name"))
+    if cdc_id and cdc_id != "UNKNOWN":
+        return "CDC ID", cdc_id
+    if client_name and client_name != "UNKNOWN":
+        return "Client Name", client_name
+    return "", ""
+
+def enforce_single_broker_account(supabase, user_id: str, parsed: dict):
+    broker = parsed.get("broker", "Unknown")
+    id_label, id_value = broker_account_identity(parsed)
+    if not id_value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not identify the {broker} account in this PDF. Please upload a statement with a clear client name or CDC ID."
+        )
+
+    existing = supabase.table("statements").select("client_name,cdc_id").eq(
+        "user_id", user_id
+    ).eq("broker", broker).execute().data or []
+
+    existing_accounts = {}
+    for row in existing:
+        existing_label, existing_value = broker_account_identity({**row, "broker": broker})
+        if existing_value:
+            existing_accounts[existing_value] = existing_label
+
+    if not existing_accounts or id_value in existing_accounts:
+        return
+
+    existing_label, existing_value = next(iter(existing_accounts.items()))
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Only one {broker} account is allowed per user. "
+            f"This PDF belongs to {id_label} {id_value}, but your tracker already has "
+            f"{existing_label} {existing_value} for {broker}."
+        )
+    )
+
+TRADE_MONEY_FIELDS = (
+    "commission", "sst", "cdc", "cvt_wht", "others", "laga", "secp", "ncs",
+    "total_charges", "gross_amount", "net_amount"
+)
+
+TRADE_COPY_FIELDS = (
+    "user_id", "statement_db_id", "statement_id", "unique_statement_id", "broker",
+    "trade_date", "symbol", "company_name", "trade_type", "settlement_type",
+    "quantity", "rate", "commission", "sst", "cdc", "cvt_wht", "others",
+    "laga", "secp", "ncs", "total_charges", "gross_amount", "net_amount",
+    "is_futures", "is_short_sell"
+)
+
+def scaled_trade_values(trade: dict, quantity: int) -> dict:
+    original_qty = int(trade.get("quantity") or 0)
+    ratio = quantity / original_qty if original_qty else 0
+    values = {"quantity": quantity}
+    for field in TRADE_MONEY_FIELDS:
+        values[field] = round(float(trade.get(field) or 0) * ratio, 4)
+    return values
+
+def split_trade_for_match(supabase, trade: dict, match_qty: int):
+    original_qty = int(trade["quantity"])
+    if match_qty >= original_qty:
+        return {**trade}, None
+
+    matched_values = scaled_trade_values(trade, match_qty)
+    residual_qty = original_qty - match_qty
+    residual_values = scaled_trade_values(trade, residual_qty)
+
+    supabase.table("trades").update(matched_values).eq("id", trade["id"]).execute()
+
+    residual_payload = {
+        field: trade.get(field)
+        for field in TRADE_COPY_FIELDS
+        if field in trade
+    }
+    residual_payload.update(residual_values)
+    residual_payload.update({
+        "matched": False,
+        "pair_id": None,
+        "gross_pl": None,
+        "net_pl": None,
+    })
+    inserted = supabase.table("trades").insert(residual_payload).execute().data[0]
+
+    return {**trade, **matched_values}, inserted
+
+
+def _match_trades_exact_quantity_legacy(user_id, supabase):
     """
-    Greedy quantity-based matching across all unmatched trades per symbol.
+    Greedy quantity-based matching across all unmatched trades per exact symbol.
+    Futures are matched only within the same contract month because their symbol
+    includes the month suffix, for example DGKC-APR and DGKC-MAY stay separate.
 
     PAEL example:
       BUYs  (sorted by date): [698 @ Apr2, 302 @ Apr2]   → total 1000
@@ -324,20 +635,20 @@ def match_trades(user_id, supabase):
 
     by_sym = {}
     for t in rows:
-        by_sym.setdefault(t["symbol"], {"BUY": [], "SELL": []})
-        by_sym[t["symbol"]][t["trade_type"]].append(t)
+        key = (t.get("broker") or "Unknown", t["symbol"])
+        by_sym.setdefault(key, {"BUY": [], "SELL": []})
+        by_sym[key][t["trade_type"]].append(t)
 
-    for sym, sides in by_sym.items():
+    for (broker, sym), sides in by_sym.items():
         buys  = list(sides["BUY"])   # ordered by trade_date (from DB query)
         sells = list(sides["SELL"])
 
         bi = si = 0  # current pointers
 
         while bi < len(buys) and si < len(sells):
-            running_buy  = 0
-            running_sell = 0
-            tmp_bi = bi
-            tmp_si = si
+            buy = buys[bi]
+            sell = sells[si]
+            match_qty = min(int(buy["quantity"]), int(sell["quantity"]))
 
             # Accumulate rows until both sides have equal total qty
             while True:
@@ -380,11 +691,73 @@ def match_trades(user_id, supabase):
                 "net_pl":   net_pl,
             }).in_("id", all_ids).execute()
 
-            print(f"  ✓ {sym}: {len(matched_buys)}×BUY + {len(matched_sells)}×SELL "
+            print(f"  OK {broker} {sym}: {len(matched_buys)}xBUY + {len(matched_sells)}xSELL "
                   f"qty={running_buy} net_pl={net_pl}")
 
             bi = tmp_bi
             si = tmp_si
+
+
+def match_trades(user_id, supabase):
+    """
+    Match unmatched trades per broker + exact symbol. Partial fills are split:
+    the closed quantity gets a pair/P&L, and the leftover quantity stays open.
+    """
+    rows = (
+        supabase.table("trades")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("matched", False)
+        .order("trade_date")
+        .execute()
+        .data
+    )
+
+    by_sym = {}
+    for t in rows:
+        key = (t.get("broker") or "Unknown", t["symbol"])
+        by_sym.setdefault(key, {"BUY": [], "SELL": []})
+        by_sym[key][t["trade_type"]].append(t)
+
+    for (broker, sym), sides in by_sym.items():
+        buys = list(sides["BUY"])
+        sells = list(sides["SELL"])
+        bi = si = 0
+
+        while bi < len(buys) and si < len(sells):
+            buy = buys[bi]
+            sell = sells[si]
+            match_qty = min(int(buy["quantity"]), int(sell["quantity"]))
+            if match_qty <= 0:
+                break
+
+            matched_buy, buy_remainder = split_trade_for_match(supabase, buy, match_qty)
+            matched_sell, sell_remainder = split_trade_for_match(supabase, sell, match_qty)
+
+            pair_id = str(uuid.uuid4())
+            gross_pl = round(matched_sell["gross_amount"] - matched_buy["gross_amount"], 2)
+            net_pl = round(
+                gross_pl - matched_buy["total_charges"] - matched_sell["total_charges"], 2
+            )
+
+            supabase.table("trades").update({
+                "matched": True,
+                "pair_id": pair_id,
+                "gross_pl": gross_pl,
+                "net_pl": net_pl,
+            }).in_("id", [matched_buy["id"], matched_sell["id"]]).execute()
+
+            print(f"  OK {broker} {sym}: 1xBUY + 1xSELL qty={match_qty} net_pl={net_pl}")
+
+            if buy_remainder:
+                buys[bi] = buy_remainder
+            else:
+                bi += 1
+
+            if sell_remainder:
+                sells[si] = sell_remainder
+            else:
+                si += 1
 
 
 def aggregate_unmatched_trades(trades: list) -> list:
@@ -393,11 +766,11 @@ def aggregate_unmatched_trades(trades: list) -> list:
 
     groups: dict = {}
     for t in unmatched:
-        key = (t["symbol"], t["trade_type"])
+        key = (t.get("broker") or "Unknown", t["symbol"], t["trade_type"])
         groups.setdefault(key, []).append(t)
 
     aggregated = []
-    for (symbol, trade_type), group in groups.items():
+    for (broker, symbol, trade_type), group in groups.items():
         if len(group) == 1:
             aggregated.append({
                 **group[0],
@@ -458,7 +831,7 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
     pdf_bytes = await file.read()
 
     try:
-        parsed = parse_munir_khanani_pdf(pdf_bytes)
+        parsed = parse_pdf_statement(pdf_bytes)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -469,24 +842,67 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
 
     supabase = get_supabase()
     user_id  = supabase.auth.get_user(token).user.id
+    enforce_single_broker_account(supabase, user_id, parsed)
+    raw_unique_id = parsed["unique_statement_id"]
+    storage_unique_id = user_scoped_statement_id(user_id, raw_unique_id)
+    candidate_unique_ids = [raw_unique_id, storage_unique_id]
 
-    if supabase.table("statements").select("id").eq(
-        "unique_statement_id", parsed["unique_statement_id"]
-    ).eq("user_id", user_id).execute().data:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Statement {parsed['statement_id']} with these stocks from {parsed['trade_date']} already imported."
+    duplicate = []
+    stale_statement_ids = []
+
+    exact_statements = find_user_statements_by_unique_ids(supabase, user_id, candidate_unique_ids)
+
+    for statement in exact_statements:
+        existing_signature, existing_count = statement_trade_signature(supabase, user_id, statement["id"])
+        if existing_count == 0:
+            stale_statement_ids.append(statement["id"])
+        elif existing_signature == parsed["trade_signature"]:
+            duplicate = [statement]
+            break
+
+    legacy_id = parsed.get("legacy_unique_statement_id")
+    if not duplicate and legacy_id and legacy_id != raw_unique_id:
+        legacy_statements = find_user_statements_by_unique_ids(
+            supabase,
+            user_id,
+            [legacy_id, user_scoped_statement_id(user_id, legacy_id)]
         )
 
-    stmt = supabase.table("statements").insert({
-        "user_id":             user_id,
-        "statement_id":        parsed["statement_id"],
-        "unique_statement_id": parsed["unique_statement_id"],
-        "trade_date":          parsed["trade_date"],
-        "settlement_date":     parsed["settlement_date"],
-        "client_name":         parsed["client_name"],
-        "cdc_id":              parsed["cdc_id"],
-    }).execute()
+        for legacy_statement in legacy_statements:
+            existing_signature, existing_count = statement_trade_signature(supabase, user_id, legacy_statement["id"])
+            if existing_count == 0:
+                stale_statement_ids.append(legacy_statement["id"])
+            elif existing_signature == parsed["trade_signature"]:
+                duplicate = [legacy_statement]
+                break
+
+    for stale_id in stale_statement_ids:
+        delete_statement_by_id(supabase, user_id, stale_id)
+        print(f"  Removed stale empty statement {stale_id}")
+
+    if duplicate:
+        for duplicate_statement in duplicate:
+            delete_statement_by_id(supabase, user_id, duplicate_statement["id"])
+            print(f"  Replacing existing statement {duplicate_statement['id']}")
+
+    try:
+        stmt = supabase.table("statements").insert({
+            "user_id":             user_id,
+            "statement_id":        parsed["statement_id"],
+            "unique_statement_id": storage_unique_id,
+            "broker":              parsed.get("broker", "Unknown"),
+            "trade_date":          parsed["trade_date"],
+            "settlement_date":     parsed["settlement_date"],
+            "client_name":         parsed["client_name"],
+            "cdc_id":              parsed["cdc_id"],
+        }).execute()
+    except APIError as e:
+        if getattr(e, "code", None) == "23505" or "23505" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail="This statement already exists. Refresh the tracker; if it is not visible, delete the old duplicate statement and upload again."
+            )
+        raise
 
     db_id = stmt.data[0]["id"]
 
@@ -494,7 +910,8 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
         "user_id":             user_id,
         "statement_db_id":     db_id,
         "statement_id":        parsed["statement_id"],
-        "unique_statement_id": parsed["unique_statement_id"],
+        "unique_statement_id": storage_unique_id,
+        "broker":              parsed.get("broker", "Unknown"),
         "trade_date":          parsed["trade_date"],
         "symbol":              t["symbol"],
         "company_name":        t["company_name"],
@@ -513,6 +930,7 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
         "total_charges":       t["total_charges"],
         "gross_amount":        t["gross_amount"],
         "net_amount":          t["net_amount"],
+        "is_futures":          t.get("is_futures", False),
         "is_short_sell":       False,
         "matched":             False,
         "pair_id":             None,
@@ -524,6 +942,7 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
     return {
         "success":         True,
         "statement_id":    parsed["statement_id"],
+        "broker":          parsed.get("broker", "Unknown"),
         "trade_date":      parsed["trade_date"],
         "trades_imported": len(parsed["trades"]),
         "message": f"Imported {len(parsed['trades'])} trade(s) from {parsed['statement_id']} ({parsed['trade_date']})"
@@ -552,31 +971,55 @@ async def get_trades(
 
     return {"trades": trades}
 
+@app.post("/api/trades/rematch")
+async def rematch_trades(token: str = Depends(verify_token)):
+    supabase = get_supabase()
+    user_id  = supabase.auth.get_user(token).user.id
+    match_trades(user_id, supabase)
+    return {"success": True}
+
 
 @app.get("/api/summary")
 async def get_summary(token: str=Depends(verify_token)):
     supabase = get_supabase()
     user_id  = supabase.auth.get_user(token).user.id
-    trades   = supabase.table("trades").select("*").eq("user_id", user_id).eq("matched", True).not_.is_("net_pl","null").execute().data
+    matched_trades = supabase.table("trades").select("*").eq("user_id", user_id).eq("matched", True).not_.is_("net_pl","null").execute().data
+    all_trades = supabase.table("trades").select("broker,total_charges").eq("user_id", user_id).execute().data
     seen = set(); pairs = []
-    for t in trades:
+    for t in matched_trades:
         if t["pair_id"] and t["pair_id"] not in seen:
             seen.add(t["pair_id"]); pairs.append(t)
     today = date.today().isoformat()
     ws = (date.today() - timedelta(days=date.today().weekday())).isoformat()
     ms    = date.today().replace(day=1).isoformat()
     def pl(lst): return round(sum(t["net_pl"] for t in lst if t.get("net_pl")), 2)
+    def win_rate(lst): return round(len([t for t in lst if t.get("net_pl",0) > 0]) / len(lst) * 100, 1) if lst else 0
     best  = max(pairs, key=lambda t: t.get("net_pl", 0), default=None)
     worst = min(pairs, key=lambda t: t.get("net_pl", 0), default=None)
+
+    broker_names = sorted(set((t.get("broker") or "Unknown") for t in all_trades + pairs))
+    brokers = []
+    for broker in broker_names:
+        broker_pairs = [t for t in pairs if (t.get("broker") or "Unknown") == broker]
+        broker_rows = [t for t in all_trades if (t.get("broker") or "Unknown") == broker]
+        brokers.append({
+            "broker": broker,
+            "pl": pl(broker_pairs),
+            "trades": len(broker_pairs),
+            "win_rate": win_rate(broker_pairs),
+            "charges": round(sum(t.get("total_charges") or 0 for t in broker_rows), 2),
+        })
+
     return {
         "today_pl":      pl([t for t in pairs if t["trade_date"] == today]),
         "week_pl":       pl([t for t in pairs if t["trade_date"] >= ws]),
         "month_pl":      pl([t for t in pairs if t["trade_date"] >= ms]),
-        "total_charges": round(sum(t["total_charges"] for t in trades), 2),
-        "win_rate":      round(len([t for t in pairs if t.get("net_pl",0) > 0]) / len(pairs) * 100, 1) if pairs else 0,
+        "total_charges": round(sum(t.get("total_charges") or 0 for t in all_trades), 2),
+        "win_rate":      win_rate(pairs),
         "total_trades":  len(pairs),
         "best_trade":    {"symbol": best["symbol"],  "pl": best["net_pl"]}  if best  else None,
         "worst_trade":   {"symbol": worst["symbol"], "pl": worst["net_pl"]} if worst else None,
+        "brokers":       brokers,
     }
 
 @app.get("/api/calendar")
