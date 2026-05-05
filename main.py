@@ -5,6 +5,7 @@ import re
 import io
 import os
 import uuid
+import hashlib
 from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
 from supabase import create_client, Client
@@ -235,7 +236,8 @@ def parse_trade_line(line, symbol, company):
     laga     = parse_pdf_number(values[7])
     secp     = parse_pdf_number(values[8])
     ncs      = parse_pdf_number(values[9])
-    commission = round(qty * rate * comm_raw / 100, 2) if comm_raw < 1 else round(comm_raw, 2)
+    # Munir Khanani prints Comm. as a per-share rate, not as a percentage of value.
+    commission = round(qty * comm_raw, 2)
     total_charges = round(commission + sst + cdc + cvt_wht + others + laga + secp + ncs, 2)
     
     # Detect if it's a futures contract
@@ -267,6 +269,10 @@ def build_trade_signature(trades: list) -> str:
             item["settlement_type"], item["symbol"], item["trade_type"], int(item["quantity"]), float(item["rate"])
         ))
     )
+
+def stable_statement_suffix(*parts: Optional[str]) -> str:
+    basis = "|".join(normalize_account_value(part) for part in parts if part)
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:10].upper()
 
 def statement_trade_signature(supabase, user_id: str, statement_id: str) -> Tuple[str, int]:
     existing_trades = supabase.table("trades").select(
@@ -322,7 +328,8 @@ def parse_munir_khanani_pdf(pdf_bytes: bytes) -> dict:
     cdc_m  = re.search(r'CDC\s*ID\s*:(\d+)', full_text)
     cli_m  = re.search(r'SR\d+\s+([A-Z][A-Z\s]+?)(?:\s+CDC|\s*$)', full_text, re.MULTILINE)
 
-    statement_id = f"SR{sr_m.group(1)}" if sr_m else "UNKNOWN"
+    statement_id = f"SR{sr_m.group(1)}" if sr_m else None
+    
     client_name  = re.sub(r'[\s@+]+$', '', cli_m.group(1)).strip() if cli_m else "Unknown"
 
     trade_date = date.today().isoformat()
@@ -351,8 +358,20 @@ def parse_munir_khanani_pdf(pdf_bytes: bytes) -> dict:
 
     symbols_in_pdf = sorted(set(t["symbol"] for t in trades))
     symbols_str    = "_".join(symbols_in_pdf) if symbols_in_pdf else "UNKNOWN"
-    legacy_unique_id = f"{statement_id}_{trade_date}_{symbols_str}"
     trade_signature = build_trade_signature(trades)
+
+    if not statement_id:
+        pdf_date = dt_m.group(1).replace("-", "") if dt_m else trade_date.replace("-", "")
+        suffix = stable_statement_suffix(
+            "MK",
+            trade_date,
+            set_m.group(1) if set_m else None,
+            cdc_m.group(1) if cdc_m else client_name,
+            trade_signature,
+        )
+        statement_id = f"MK-{pdf_date}-{suffix}"
+
+    legacy_unique_id = f"{statement_id}_{trade_date}_{symbols_str}"
     unique_id      = f"{legacy_unique_id}_{trade_signature}" if trade_signature else legacy_unique_id
 
     print(f"DEBUG: {statement_id} {trade_date} -> {len(trades)} trades | unique_id: {unique_id}")
@@ -403,7 +422,9 @@ def parse_akd_pdf(pdf_bytes: bytes) -> dict:
 
     memo_m = AKD_MEMO_RE.search(full_text)
     client_m = AKD_CLIENT_RE.search(full_text)
-    statement_id = memo_m.group(1).strip() if memo_m else "UNKNOWN"
+    
+    statement_id = memo_m.group(1).strip() if memo_m else None
+    
     client_name = client_m.group(1).strip() if client_m else "Unknown"
 
     trades = []
@@ -478,8 +499,13 @@ def parse_akd_pdf(pdf_bytes: bytes) -> dict:
         raise ValueError("No AKD trade rows found")
 
     symbols_str = "_".join(sorted(set(t["symbol"] for t in trades)))
-    legacy_unique_id = f"AKD_{statement_id}_{trade_date}_{symbols_str}"
     trade_signature = build_trade_signature(trades)
+
+    if not statement_id:
+        suffix = stable_statement_suffix("AKD", trade_date, client_name, trade_signature)
+        statement_id = f"AKD-{trade_date.replace('-', '')}-{suffix}"
+
+    legacy_unique_id = f"AKD_{statement_id}_{trade_date}_{symbols_str}"
     unique_id = f"{legacy_unique_id}_{trade_signature}" if trade_signature else legacy_unique_id
 
     return {
@@ -824,7 +850,7 @@ async def health():
     return {"status": "ok", "service": "PSX Profit Tracker API"}
 
 @app.post("/api/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_token)):
+async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_token), force: bool = False):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files accepted")
 
@@ -845,45 +871,114 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
     enforce_single_broker_account(supabase, user_id, parsed)
     raw_unique_id = parsed["unique_statement_id"]
     storage_unique_id = user_scoped_statement_id(user_id, raw_unique_id)
-    candidate_unique_ids = [raw_unique_id, storage_unique_id]
+    
+    print(f"[UPLOAD] force={force}, user_id={user_id}, raw_id={raw_unique_id}, storage_id={storage_unique_id}")
+
+    # Search for existing statements with this unique_id
+    existing = supabase.table("statements").select("id,unique_statement_id").eq(
+        "unique_statement_id", storage_unique_id
+    ).eq("user_id", user_id).execute().data or []
+    
+    print(f"[UPLOAD] Found {len(existing)} existing statements with storage_unique_id")
 
     duplicate = []
     stale_statement_ids = []
 
-    exact_statements = find_user_statements_by_unique_ids(supabase, user_id, candidate_unique_ids)
-
-    for statement in exact_statements:
+    for statement in existing:
         existing_signature, existing_count = statement_trade_signature(supabase, user_id, statement["id"])
+        print(f"[UPLOAD] Statement {statement['id']}: {existing_count} trades, signature match: {existing_signature == parsed['trade_signature']}")
+        
         if existing_count == 0:
+            # Empty statement, always delete
             stale_statement_ids.append(statement["id"])
         elif existing_signature == parsed["trade_signature"]:
-            duplicate = [statement]
-            break
+            if force:
+                print(f"[UPLOAD] Force mode: exact duplicate - replacing old statement {statement['id']}")
+                stale_statement_ids.append(statement["id"])
+            else:
+                print(f"[UPLOAD] Exact duplicate - returning conflict")
+                duplicate = [statement]
+                break
+        else:
+            # Different signature (different number of trades)
+            if force:
+                # User is forcing re-import, so delete the old one
+                print(f"[UPLOAD] Force mode: signature mismatch ({existing_count} vs {len(parsed['trades'])}) - deleting old statement")
+                stale_statement_ids.append(statement["id"])
+            else:
+                # Not forcing: this is a conflict situation
+                print(f"[UPLOAD] Signature mismatch ({existing_count} vs {len(parsed['trades'])}) - showing user the conflict option")
+                duplicate = [statement]
+                break
 
+    # Also check legacy format
     legacy_id = parsed.get("legacy_unique_statement_id")
     if not duplicate and legacy_id and legacy_id != raw_unique_id:
-        legacy_statements = find_user_statements_by_unique_ids(
-            supabase,
-            user_id,
-            [legacy_id, user_scoped_statement_id(user_id, legacy_id)]
-        )
-
-        for legacy_statement in legacy_statements:
+        print(f"[UPLOAD] Checking legacy format: {legacy_id}")
+        legacy_storage_id = user_scoped_statement_id(user_id, legacy_id)
+        legacy_existing = supabase.table("statements").select("id,unique_statement_id").eq(
+            "unique_statement_id", legacy_storage_id
+        ).eq("user_id", user_id).execute().data or []
+        
+        for legacy_statement in legacy_existing:
             existing_signature, existing_count = statement_trade_signature(supabase, user_id, legacy_statement["id"])
             if existing_count == 0:
                 stale_statement_ids.append(legacy_statement["id"])
             elif existing_signature == parsed["trade_signature"]:
-                duplicate = [legacy_statement]
-                break
+                if force:
+                    print(f"[UPLOAD] Force mode: legacy exact duplicate - deleting old statement")
+                    stale_statement_ids.append(legacy_statement["id"])
+                else:
+                    print(f"[UPLOAD] Legacy exact duplicate - returning conflict")
+                    duplicate = [legacy_statement]
+                    break
+            else:
+                if force:
+                    print(f"[UPLOAD] Force mode: legacy signature mismatch - deleting old statement")
+                    stale_statement_ids.append(legacy_statement["id"])
+                else:
+                    duplicate = [legacy_statement]
+                    break
 
+    if not duplicate and parsed.get("trade_signature"):
+        broker = parsed.get("broker", "Unknown")
+        print(f"[UPLOAD] Checking same-day statements by trade signature: broker={broker}, trade_date={parsed['trade_date']}")
+        same_day_query = supabase.table("statements").select("id,unique_statement_id").eq(
+            "user_id", user_id
+        ).eq("trade_date", parsed["trade_date"])
+        if broker:
+            same_day_query = same_day_query.eq("broker", broker)
+        same_day_statements = same_day_query.execute().data or []
+
+        ignored_ids = {s["id"] for s in existing} | set(stale_statement_ids)
+        for same_day_statement in same_day_statements:
+            if same_day_statement["id"] in ignored_ids:
+                continue
+            existing_signature, existing_count = statement_trade_signature(supabase, user_id, same_day_statement["id"])
+            if existing_count == 0:
+                stale_statement_ids.append(same_day_statement["id"])
+                continue
+            if existing_signature == parsed["trade_signature"]:
+                if force:
+                    print(f"[UPLOAD] Force mode: old generated-id duplicate - deleting {same_day_statement['id']}")
+                    stale_statement_ids.append(same_day_statement["id"])
+                else:
+                    print(f"[UPLOAD] Old generated-id duplicate - returning conflict")
+                    duplicate = [same_day_statement]
+                    break
+
+    print(f"[UPLOAD] Deleting {len(stale_statement_ids)} stale/duplicate statements")
     for stale_id in stale_statement_ids:
         delete_statement_by_id(supabase, user_id, stale_id)
-        print(f"  Removed stale empty statement {stale_id}")
+        print(f"  ✓ Removed stale/duplicate statement {stale_id}")
 
-    if duplicate:
-        for duplicate_statement in duplicate:
-            delete_statement_by_id(supabase, user_id, duplicate_statement["id"])
-            print(f"  Replacing existing statement {duplicate_statement['id']}")
+    if duplicate and not force:
+        print(f"[UPLOAD] Returning 409 conflict (not forcing)")
+        statement_identifier = parsed["statement_id"]
+        raise HTTPException(
+            status_code=409,
+            detail=f"This statement already exists (ID: {statement_identifier}). Use force re-import if you believe a trade was missed."
+        )
 
     try:
         stmt = supabase.table("statements").insert({
@@ -896,11 +991,14 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
             "client_name":         parsed["client_name"],
             "cdc_id":              parsed["cdc_id"],
         }).execute()
+        print(f"[UPLOAD] Created new statement {stmt.data[0]['id']}")
     except APIError as e:
         if getattr(e, "code", None) == "23505" or "23505" in str(e):
+            print(f"[UPLOAD] Unique constraint violation (duplicate insert)")
+            statement_identifier = parsed["statement_id"]
             raise HTTPException(
                 status_code=409,
-                detail="This statement already exists. Refresh the tracker; if it is not visible, delete the old duplicate statement and upload again."
+                detail=f"Statement {statement_identifier} already exists. Try force re-import or contact support if the issue persists."
             )
         raise
 
