@@ -724,10 +724,29 @@ def _match_trades_exact_quantity_legacy(user_id, supabase):
             si = tmp_si
 
 
+def clear_all_matched_trades(user_id, supabase):
+    """
+    Reset all matched trades for a user to unmatched state.
+    This prepares for fresh re-matching on new uploads.
+    """
+    supabase.table("trades").update({
+        "matched": False,
+        "pair_id": None,
+        "gross_pl": None,
+        "net_pl": None,
+    }).eq("user_id", user_id).execute()
+    print(f"[REMATCH] Cleared all matched trades for user {user_id}")
+
+
 def match_trades(user_id, supabase):
     """
-    Match unmatched trades per broker + exact symbol. Partial fills are split:
-    the closed quantity gets a pair/P&L, and the leftover quantity stays open.
+    Match unmatched trades per broker + exact symbol:
+    - Aggregate all BUYs and SELLs for a symbol
+    - Match min(total_buy, total_sell) in ONE pair
+    - Split trades as needed so matched trades show correct qty
+    - Remainder becomes new unmatched trade
+    
+    Example: 2000 BUY + 8000 SELL → 1 pair(2000/2000) + 6000 SELL unmatched
     """
     rows = (
         supabase.table("trades")
@@ -748,42 +767,82 @@ def match_trades(user_id, supabase):
     for (broker, sym), sides in by_sym.items():
         buys = list(sides["BUY"])
         sells = list(sides["SELL"])
-        bi = si = 0
+        
+        if not buys or not sells:
+            continue
 
-        while bi < len(buys) and si < len(sells):
-            buy = buys[bi]
-            sell = sells[si]
-            match_qty = min(int(buy["quantity"]), int(sell["quantity"]))
-            if match_qty <= 0:
+        # Calculate totals
+        total_buy_qty = sum(int(b["quantity"]) for b in buys)
+        total_sell_qty = sum(int(s["quantity"]) for s in sells)
+        match_qty = min(total_buy_qty, total_sell_qty)
+
+        if match_qty <= 0:
+            continue
+
+        pair_id = str(uuid.uuid4())
+        matched_ids = []  # Track all IDs that will be in this pair
+        remaining_to_match_buy = match_qty
+        remaining_to_match_sell = match_qty
+
+        # Split BUY trades: keep taking until we reach match_qty
+        for buy_trade in buys:
+            if remaining_to_match_buy <= 0:
                 break
-
-            matched_buy, buy_remainder = split_trade_for_match(supabase, buy, match_qty)
-            matched_sell, sell_remainder = split_trade_for_match(supabase, sell, match_qty)
-
-            pair_id = str(uuid.uuid4())
-            gross_pl = round(matched_sell["gross_amount"] - matched_buy["gross_amount"], 2)
-            net_pl = round(
-                gross_pl - matched_buy["total_charges"] - matched_sell["total_charges"], 2
-            )
-
-            supabase.table("trades").update({
-                "matched": True,
-                "pair_id": pair_id,
-                "gross_pl": gross_pl,
-                "net_pl": net_pl,
-            }).in_("id", [matched_buy["id"], matched_sell["id"]]).execute()
-
-            print(f"  OK {broker} {sym}: 1xBUY + 1xSELL qty={match_qty} net_pl={net_pl}")
-
-            if buy_remainder:
-                buys[bi] = buy_remainder
+            
+            buy_qty = int(buy_trade["quantity"])
+            split_qty = min(buy_qty, remaining_to_match_buy)
+            
+            if split_qty == buy_qty:
+                # Entire trade matches, no split needed
+                matched_ids.append(buy_trade["id"])
+                remaining_to_match_buy -= buy_qty
             else:
-                bi += 1
+                # Need to split: keep matched portion, create remainder
+                matched_buy, remainder_buy = split_trade_for_match(supabase, buy_trade, split_qty)
+                matched_ids.append(matched_buy["id"])
+                remaining_to_match_buy -= split_qty
 
-            if sell_remainder:
-                sells[si] = sell_remainder
+        # Split SELL trades: keep taking until we reach match_qty
+        for sell_trade in sells:
+            if remaining_to_match_sell <= 0:
+                break
+            
+            sell_qty = int(sell_trade["quantity"])
+            split_qty = min(sell_qty, remaining_to_match_sell)
+            
+            if split_qty == sell_qty:
+                # Entire trade matches, no split needed
+                matched_ids.append(sell_trade["id"])
+                remaining_to_match_sell -= sell_qty
             else:
-                si += 1
+                # Need to split: keep matched portion, create remainder
+                matched_sell, remainder_sell = split_trade_for_match(supabase, sell_trade, split_qty)
+                matched_ids.append(matched_sell["id"])
+                remaining_to_match_sell -= split_qty
+
+        # Calculate P&L from matched trades
+        matched_trades = supabase.table("trades").select("*").in_("id", matched_ids).execute().data
+        buys_in_pair = [t for t in matched_trades if t["trade_type"] == "BUY"]
+        sells_in_pair = [t for t in matched_trades if t["trade_type"] == "SELL"]
+        
+        total_buy_gross = sum(b["gross_amount"] for b in buys_in_pair)
+        total_buy_charges = sum(b["total_charges"] for b in buys_in_pair)
+        total_sell_gross = sum(s["gross_amount"] for s in sells_in_pair)
+        total_sell_charges = sum(s["total_charges"] for s in sells_in_pair)
+        
+        gross_pl = round(total_sell_gross - total_buy_gross, 2)
+        net_pl = round(gross_pl - total_buy_charges - total_sell_charges, 2)
+
+        # Mark all matched trades with this pair_id and P&L
+        supabase.table("trades").update({
+            "matched": True,
+            "pair_id": pair_id,
+            "gross_pl": gross_pl,
+            "net_pl": net_pl,
+        }).in_("id", matched_ids).execute()
+
+        print(f"  OK {broker} {sym}: BUY({sum(int(b['quantity']) for b in buys_in_pair)}) + "
+              f"SELL({sum(int(s['quantity']) for s in sells_in_pair)}) → 1 pair, net_pl={net_pl}")
 
 
 def aggregate_unmatched_trades(trades: list) -> list:
@@ -1035,6 +1094,10 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
     } for t in parsed["trades"]]
 
     supabase.table("trades").insert(rows).execute()
+    
+    # Clear all previous matching and re-match everything
+    # This ensures consistent output regardless of upload order
+    clear_all_matched_trades(user_id, supabase)
     match_trades(user_id, supabase)
 
     return {
