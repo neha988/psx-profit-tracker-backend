@@ -872,20 +872,20 @@ def aggregate_unmatched_trades(trades: list) -> list:
 
         aggregated.append({
             **group[0],
-            "id":               [g["id"] for g in group],
+            "id":               group[0]["id"],
             "quantity":         total_qty,
             "rate":             avg_rate,
             "gross_amount":     round(total_gross, 2),
-            "net_amount":       round(sum(g["net_amount"]    for g in group), 2),
-            "commission":       round(sum(g["commission"]    for g in group), 2),
-            "sst":              round(sum(g["sst"]           for g in group), 2),
-            "cdc":              round(sum(g["cdc"]           for g in group), 2),
-            "cvt_wht":          round(sum(g["cvt_wht"]       for g in group), 2),
-            "others":           round(sum(g["others"]        for g in group), 2),
-            "laga":             round(sum(g["laga"]          for g in group), 2),
-            "secp":             round(sum(g["secp"]          for g in group), 2),
-            "ncs":              round(sum(g["ncs"]           for g in group), 2),
-            "total_charges":    round(sum(g["total_charges"] for g in group), 2),
+            "net_amount":       round(sum((g.get("net_amount") or 0)    for g in group), 2),
+            "commission":       round(sum((g.get("commission") or 0)    for g in group), 2),
+            "sst":              round(sum((g.get("sst") or 0)           for g in group), 2),
+            "cdc":              round(sum((g.get("cdc") or 0)           for g in group), 2),
+            "cvt_wht":          round(sum((g.get("cvt_wht") or 0)       for g in group), 2),
+            "others":           round(sum((g.get("others") or 0)        for g in group), 2),
+            "laga":             round(sum((g.get("laga") or 0)          for g in group), 2),
+            "secp":             round(sum((g.get("secp") or 0)          for g in group), 2),
+            "ncs":              round(sum((g.get("ncs") or 0)           for g in group), 2),
+            "total_charges":    round(sum((g.get("total_charges") or 0) for g in group), 2),
             "trade_date":       dates[0],
             "trade_dates":      dates,
             "aggregated":       True,
@@ -1070,7 +1070,7 @@ async def upload_pdf(file: UploadFile = File(...), token: str = Depends(verify_t
         "unique_statement_id": storage_unique_id,
         "broker":              parsed.get("broker", "Unknown"),
         "trade_date":          parsed["trade_date"],
-        "symbol":              t["symbol"],
+        "symbol":              (t.get("symbol") or "").upper(),
         "company_name":        t["company_name"],
         "trade_type":          t["trade_type"],
         "settlement_type":     t["settlement_type"],
@@ -1315,6 +1315,149 @@ async def cancel_discord_message(
     
     supabase.table("discord_messages").delete().eq("id", message_id).execute()
     return {"success": True}
+
+# ─────────────────────────────────────────────────────────────
+# TRADE MANAGEMENT (Add, Edit, Delete)
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/api/trades/add")
+async def add_trade(
+    trade_data: dict,
+    token: str = Depends(verify_token)
+):
+    """Add a new manual trade"""
+    supabase = get_supabase()
+    user_id = supabase.auth.get_user(token).user.id
+    
+    try:
+        # Convert string values to numbers
+        quantity = float(trade_data.get("quantity", 0))
+        rate = float(trade_data.get("rate", 0))
+        total_charges = float(trade_data.get("total_charges", 0))
+        commission = float(trade_data.get("commission", 0))
+        
+        gross_amount = quantity * rate
+        net_amount = gross_amount - total_charges
+        
+        trade_record = {
+            "user_id": user_id,
+            "symbol": (trade_data.get("symbol") or "").upper(),
+            "company_name": trade_data.get("company_name", trade_data.get("symbol")),
+            "trade_type": trade_data.get("trade_type"),  # BUY or SELL
+            "trade_date": trade_data.get("trade_date"),
+            "quantity": int(quantity),
+            "rate": rate,
+            "total_charges": total_charges,
+            "commission": commission,
+            "gross_amount": gross_amount,
+            "net_amount": net_amount,
+            "broker": trade_data.get("broker", "Manual"),
+            "settlement_type": trade_data.get("settlement_type", "Ready"),
+            "is_futures": trade_data.get("is_futures", False),
+            "is_short_sell": False,
+            "matched": False,
+            "pair_id": None,
+            "statement_db_id": None,
+        }
+        
+        result = supabase.table("trades").insert(trade_record).execute()
+        
+        # Re-match all trades to pair the new trade with existing ones
+        match_trades(user_id, supabase)
+        
+        return {"success": True, "trade_id": result.data[0]["id"], "message": "Trade added successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to add trade: {str(e)}")
+
+@app.put("/api/trades/{trade_id}")
+async def edit_trade(
+    trade_id: str,
+    trade_data: dict,
+    token: str = Depends(verify_token)
+):
+    """Edit an existing trade"""
+    supabase = get_supabase()
+    user_id = supabase.auth.get_user(token).user.id
+    
+    try:
+        # Verify ownership
+        existing = supabase.table("trades").select("id").eq("id", trade_id).eq("user_id", user_id).execute().data
+        if not existing:
+            raise HTTPException(status_code=403, detail="Trade not found or unauthorized")
+        
+        # Convert string values to numbers
+        quantity = float(trade_data.get("quantity", 0))
+        rate = float(trade_data.get("rate", 0))
+        total_charges = float(trade_data.get("total_charges", 0))
+        commission = float(trade_data.get("commission", 0))
+        
+        gross_amount = quantity * rate
+        net_amount = gross_amount - total_charges
+        
+        update_record = {
+            "symbol": (trade_data.get("symbol") or "").upper(),
+            "company_name": trade_data.get("company_name"),
+            "trade_type": trade_data.get("trade_type"),
+            "trade_date": trade_data.get("trade_date"),
+            "quantity": int(quantity),
+            "rate": rate,
+            "total_charges": total_charges,
+            "commission": commission,
+            "gross_amount": gross_amount,
+            "net_amount": net_amount,
+            "broker": trade_data.get("broker"),
+            "settlement_type": trade_data.get("settlement_type"),
+            "is_futures": trade_data.get("is_futures", False),
+        }
+        
+        supabase.table("trades").update(update_record).eq("id", trade_id).eq("user_id", user_id).execute()
+        
+        # Re-match all trades in case the edit affects pairing
+        match_trades(user_id, supabase)
+        
+        return {"success": True, "message": "Trade updated successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to edit trade: {str(e)}")
+
+@app.delete("/api/trades/{trade_id}")
+async def delete_trade(
+    trade_id: str,
+    token: str = Depends(verify_token)
+):
+    """Delete a trade"""
+    supabase = get_supabase()
+    user_id = supabase.auth.get_user(token).user.id
+    
+    try:
+        # Verify ownership
+        existing = supabase.table("trades").select("id,pair_id").eq("id", trade_id).eq("user_id", user_id).execute().data
+        if not existing:
+            raise HTTPException(status_code=403, detail="Trade not found or unauthorized")
+        
+        trade = existing[0]
+        
+        # If trade is part of a pair, unmatch it
+        if trade.get("pair_id"):
+            supabase.table("trades").update({
+                "matched": False,
+                "pair_id": None,
+                "gross_pl": None,
+                "net_pl": None,
+            }).eq("pair_id", trade["pair_id"]).eq("user_id", user_id).execute()
+        
+        # Delete the trade
+        supabase.table("trades").delete().eq("id", trade_id).eq("user_id", user_id).execute()
+        
+        # Re-match all trades in case deletion affects pairing of remaining trades
+        match_trades(user_id, supabase)
+        
+        return {"success": True, "message": "Trade deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to delete trade: {str(e)}")
 
 # ─────────────────────────────────────────────────────────────
 # SCHEDULER STARTUP
